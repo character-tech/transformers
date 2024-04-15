@@ -876,15 +876,17 @@ class FalconDecoderLayer(nn.Module):
         )
 
         attention_output = attn_outputs[0]
-        self.logt('attention_output', attention_output)
+        self.logt('attention_output', attention_output) # OK here
         self.config.parallel_attn = False
 
 
-        residual = dropout_add(
-            attention_output, residual, self.config.attention_dropout, training=self.training
-        )
+        # residual = dropout_add(
+        #     attention_output, residual, self.config.attention_dropout, training=self.training
+        # )
+        residual = residual + attention_output
         mlp_input = self.input_layernorm(residual)
-        self.logt('mlp_input', mlp_input)
+        torch.clamp(mlp_input, -4., 4.0)
+        self.logt('l1.input.normalized_and_clamped', mlp_input)
 
         outputs = attn_outputs[1:]
         #mlp_layernorm_out = self.input_layernorm(attention_output)
@@ -1033,9 +1035,8 @@ class FalconPreTrainedModel(PreTrainedModel):
         return config
 
 
-
-MUP_EMB_INPUT_SCALE=  10.667
-MUP_LOGITS_SCALE=  0.125
+MUP_EMB_INPUT_SCALE = 10.667
+MUP_LOGITS_SCALE = 0.125
 
 @add_start_docstrings(
     "The bare Falcon Model transformer outputting raw hidden-states without any specific head on top.",
