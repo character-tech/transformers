@@ -797,10 +797,10 @@ class FalconMLP(nn.Module):
 
         middle_in = self.dense_h_to_4h(x)
         middle_in = torch.clamp(middle_in, -4, 4.)
-        self.logt('clamped_middle_in', middle_in)
+        self.logt('middle_in/clamped_middle_in', middle_in)
         x = self.act(middle_in)
         x = torch.clamp(x, -16., 16.)
-        self.logt('clamped_middle_out', x)
+        self.logt('middle_out/clamped_middle_out', x)
         x = self.dense_4h_to_h(x)
         return x
 
@@ -835,7 +835,7 @@ class FalconDecoderLayer(nn.Module):
                 self.post_attention_layernorm = LayerNorm(hidden_size, eps=config.layer_norm_epsilon)
     def logt(self, msg, t):
         if self.layer_num == 0:
-            tensor_summary(f'L{self.layer_num}: {msg}', t)
+            tensor_summary(f'L{self.layer_num+1}: {msg}', t)
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -876,7 +876,7 @@ class FalconDecoderLayer(nn.Module):
         )
 
         attention_output = attn_outputs[0]
-        self.logt('attention_output', attention_output) # OK here
+        self.logt('layer_out/attention_output', attention_output) # OK here
         self.config.parallel_attn = False
 
 
@@ -885,20 +885,23 @@ class FalconDecoderLayer(nn.Module):
         # )
         residual = residual + attention_output
         mlp_input = self.input_layernorm(residual)
-        torch.clamp(mlp_input, -4., 4.0)
-        self.logt('l1.input.normalized_and_clamped', mlp_input)
+        self.logt('layer_input_1/normed_residual', mlp_input)
+
+        mlp_input = torch.clamp(mlp_input, -4, 4.0)
+        self.logt('normalized_AaD', mlp_input)
 
         outputs = attn_outputs[1:]
         #mlp_layernorm_out = self.input_layernorm(attention_output)
 
         # MLP.
         mlp_output = self.mlp(mlp_input)
-        self.logt('mlp_output', mlp_output)
+        self.logt('layer_out/mlp_output', mlp_output)
 
         if self.config.new_decoder_architecture or self.config.parallel_attn:
             mlp_output += attention_output
 
-        output = dropout_add(mlp_output, residual, self.config.hidden_dropout, training=self.training)
+        # output = dropout_add(mlp_output, residual, self.config.hidden_dropout, training=self.training)
+        output = residual + mlp_output
 
         if use_cache:
             outputs = (output,) + outputs
@@ -1371,7 +1374,6 @@ class FalconForCausalLM(FalconPreTrainedModel):
         if not return_dict:
             output = (lm_logits,) + transformer_outputs[1:]
             return ((loss,) + output) if loss is not None else output
-
         return CausalLMOutputWithCrossAttentions(
             loss=loss,
             logits=lm_logits,
