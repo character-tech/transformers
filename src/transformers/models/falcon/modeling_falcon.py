@@ -65,6 +65,26 @@ from ..deprecated._archive_maps import FALCON_PRETRAINED_MODEL_ARCHIVE_LIST  # n
 _CHECKPOINT_FOR_DOC = "Rocketknight1/falcon-rw-1b"
 _CONFIG_FOR_DOC = "FalconConfig"
 
+def absmeanitem(t):
+    return t.to(torch.float32).abs().mean().item()
+def absmaxitem(t):
+    return t.abs().float().max().item()
+
+
+
+def tensor_summary(tensor_name, tensor):
+    mn = absmeanitem(tensor)
+    absmax =absmaxitem(tensor)
+    flat = torch.flatten(tensor)
+    elt = flat[0].item()
+    last_elt = flat[-1].item()
+    print(
+        f"DH: {tensor_name} shape: {tuple(tensor.size())} mn: {mn: .6f}  mx: {absmax:.6f} flat[0]:{elt:.4f} flat[-1]:{last_elt:.4f}"
+    )
+
+
+    #logger.info(f"{msg}: {tensor.shape}, {tensor.dtype}, {tensor.device}")
+
 
 # NOTE(Hesslow): Unfortunately we did not fuse matmul and bias during training, this means that there's one additional quantization to bfloat16 between the operations.
 # In order not to degrade the quality of our HF-port, we keep these characteristics in the final model.
@@ -261,10 +281,11 @@ def dropout_add(x: torch.Tensor, residual: torch.Tensor, prob: float, training: 
 
 
 class FalconAttention(nn.Module):
-    def __init__(self, config: FalconConfig):
+    def __init__(self, config: FalconConfig, layer_num):
         super().__init__()
 
         self.config = config
+        self.layer_num = layer_num
         self.hidden_size = config.hidden_size
         self.num_heads = config.num_attention_heads
         self.head_dim = self.hidden_size // self.num_heads
@@ -273,7 +294,7 @@ class FalconAttention(nn.Module):
         self.max_position_embeddings = config.max_position_embeddings
         self.rope_theta = config.rope_theta
         self.is_causal = True
-        self._use_sdpa = config._attn_implementation == "sdpa"
+        self._use_sdpa = False #config._attn_implementation == "sdpa"
 
         if self.head_dim * self.num_heads != self.hidden_size:
             raise ValueError(
@@ -296,9 +317,11 @@ class FalconAttention(nn.Module):
         self.query_key_value = FalconLinear(self.hidden_size, qkv_out_dim, bias=config.bias)
         self.new_decoder_architecture = config.new_decoder_architecture
         self.multi_query = config.multi_query
+        assert self.multi_query
         self.dense = FalconLinear(self.hidden_size, self.hidden_size, bias=config.bias)
         self.attention_dropout = nn.Dropout(config.attention_dropout)
         self.num_kv_heads = config.num_kv_heads if (self.new_decoder_architecture or not self.multi_query) else 1
+        assert self.num_kv_heads == 1
 
     # Copied from transformers.models.llama.modeling_llama.LlamaAttention._init_rope with Llama->Falcon
     def _init_rope(self):
@@ -397,13 +420,21 @@ class FalconAttention(nn.Module):
         output_attentions: bool = False,
         **kwargs,
     ):
+        def logt(msg, t):
+            if self.layer_num==0:
+                tensor_summary(f'L0:{msg}', t)
         if "padding_mask" in kwargs:
             warnings.warn(
                 "Passing `padding_mask` is deprecated and will be removed in v4.37. Please make sure use `attention_mask` instead.`"
             )
-
+        logt('normalized_Aad', hidden_states)
+        logt('w_in_ID', self.query_key_value.weight)
         fused_qkv = self.query_key_value(hidden_states)  # [batch_size, seq_length, 3 x hidden_size]
+        fused_qkv = torch.clamp(fused_qkv, -4., 4.)
+        logt(f'middle_in', fused_qkv)
+
         num_kv_heads = self.num_heads if self.new_decoder_architecture else self.num_kv_heads
+        assert num_kv_heads == 1
         # 3 x [batch_size, seq_length, num_heads, head_dim]
         (query_layer, key_layer, value_layer) = self._split_heads(fused_qkv)
 
@@ -412,14 +443,18 @@ class FalconAttention(nn.Module):
         query_layer = query_layer.transpose(1, 2).reshape(batch_size, self.num_heads, query_length, self.head_dim)
         key_layer = key_layer.transpose(1, 2).reshape(batch_size, num_kv_heads, query_length, self.head_dim)
         value_layer = value_layer.transpose(1, 2).reshape(batch_size, num_kv_heads, query_length, self.head_dim)
+        logt(f'q_BHLK', query_layer)
+        logt(f'k_BHLK', key_layer)
+        logt(f'v_BHLK', value_layer)
 
         kv_seq_len = key_layer.shape[-2]
         if layer_past is not None:
             kv_seq_len += layer_past[0].shape[-2]
+        assert alibi is None
         if alibi is None:
             cos, sin = self.rotary_emb(value_layer, seq_len=kv_seq_len)
             query_layer, key_layer = apply_rotary_pos_emb(query_layer, key_layer, cos, sin, position_ids)
-
+        logt(f'qroped_BHLK', query_layer)
         if layer_past is not None:
             past_key, past_value = layer_past
             # concatenate along seq_length dimension:
@@ -442,6 +477,7 @@ class FalconAttention(nn.Module):
             value_layer = value_layer.contiguous()
 
         if alibi is None:
+            assert not self._use_sdpa
             if self._use_sdpa and not output_attentions:
                 attn_output = F.scaled_dot_product_attention(
                     query_layer,
@@ -466,7 +502,11 @@ class FalconAttention(nn.Module):
             attn_output = attn_output.permute(0, 2, 1, 3)
             attn_output = attn_output.reshape(batch_size, query_length, self.num_heads * self.head_dim)
 
+            attn_output = torch.clamp(attn_output, -4., 4.)
+            logt(f'middle_out', attn_output)
+
             attn_output = self.dense(attn_output)
+            logt(f'layer_out', attn_output)
 
             if output_attentions:
                 return attn_output, present, attention_scores
@@ -575,9 +615,12 @@ class FalconFlashAttention2(FalconAttention):
         kv_seq_len = key_layer.shape[-2]
         if layer_past is not None:
             kv_seq_len += layer_past[0].shape[-2]
+        assert alibi is None
         if alibi is None:
             cos, sin = self.rotary_emb(value_layer, seq_len=kv_seq_len)
             query_layer, key_layer = apply_rotary_pos_emb(query_layer, key_layer, cos, sin, position_ids)
+
+        tensor_summary('L0: qroped', query_layer)
 
         if layer_past is not None and use_cache:
             past_key, past_value = layer_past
@@ -736,17 +779,28 @@ class FalconFlashAttention2(FalconAttention):
 
 
 class FalconMLP(nn.Module):
-    def __init__(self, config: FalconConfig):
+    def __init__(self, config: FalconConfig, layer_num):
         super().__init__()
         hidden_size = config.hidden_size
+        self.layer_num = layer_num
 
         self.dense_h_to_4h = FalconLinear(hidden_size, config.ffn_hidden_size, bias=config.bias)
         self.act = get_activation(config.activation)
         self.dense_4h_to_h = FalconLinear(config.ffn_hidden_size, hidden_size, bias=config.bias)
         self.hidden_dropout = config.hidden_dropout
 
+    def logt(self, msg, t):
+        if self.layer_num == 0:
+            tensor_summary(f'L1: {msg}', t)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.act(self.dense_h_to_4h(x))
+
+        middle_in = self.dense_h_to_4h(x)
+        middle_in = torch.clamp(middle_in, -4, 4.)
+        self.logt('middle_in/clamped_middle_in', middle_in)
+        x = self.act(middle_in)
+        x = torch.clamp(x, -16., 16.)
+        self.logt('middle_out/clamped_middle_out', x)
         x = self.dense_4h_to_h(x)
         return x
 
@@ -759,13 +813,14 @@ FALCON_ATTENTION_CLASSES = {
 
 
 class FalconDecoderLayer(nn.Module):
-    def __init__(self, config: FalconConfig):
+    def __init__(self, config: FalconConfig, layer_num):
         super().__init__()
         hidden_size = config.hidden_size
         self.num_heads = config.num_attention_heads
+        self.layer_num = layer_num
 
-        self.self_attention = FALCON_ATTENTION_CLASSES[config._attn_implementation](config)
-        self.mlp = FalconMLP(config)
+        self.self_attention = FalconAttention(config, layer_num)
+        self.mlp = FalconMLP(config, layer_num)
         self.hidden_dropout = config.hidden_dropout
         self.config = config
 
@@ -778,7 +833,9 @@ class FalconDecoderLayer(nn.Module):
             self.input_layernorm = LayerNorm(hidden_size, eps=config.layer_norm_epsilon)
             if not config.parallel_attn:
                 self.post_attention_layernorm = LayerNorm(hidden_size, eps=config.layer_norm_epsilon)
-
+    def logt(self, msg, t):
+        if self.layer_num == 0:
+            tensor_summary(f'L{self.layer_num+1}: {msg}', t)
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -798,11 +855,12 @@ class FalconDecoderLayer(nn.Module):
 
         residual = hidden_states
 
-        if self.config.new_decoder_architecture:
-            attention_layernorm_out = self.ln_attn(hidden_states)
-            mlp_layernorm_out = self.ln_mlp(hidden_states)
-        else:
-            attention_layernorm_out = self.input_layernorm(hidden_states)
+        # if self.config.new_decoder_architecture:
+        #     attention_layernorm_out = self.ln_attn(hidden_states)
+        #     mlp_layernorm_out = self.ln_mlp(hidden_states)
+        # else:
+        attention_layernorm_out = self.input_layernorm(hidden_states)
+        attention_layernorm_out = torch.clamp(attention_layernorm_out, -4., 4.)
 
         # Self attention.
         attn_outputs = self.self_attention(
@@ -818,25 +876,32 @@ class FalconDecoderLayer(nn.Module):
         )
 
         attention_output = attn_outputs[0]
+        self.logt('layer_out/attention_output', attention_output) # OK here
+        self.config.parallel_attn = False
 
-        if not self.config.new_decoder_architecture:
-            if self.config.parallel_attn:
-                mlp_layernorm_out = attention_layernorm_out
-            else:
-                residual = dropout_add(
-                    attention_output, residual, self.config.attention_dropout, training=self.training
-                )
-                mlp_layernorm_out = self.post_attention_layernorm(residual)
+
+        # residual = dropout_add(
+        #     attention_output, residual, self.config.attention_dropout, training=self.training
+        # )
+        residual = residual + attention_output
+        mlp_input = self.input_layernorm(residual)
+        self.logt('layer_input_1/normed_residual', mlp_input)
+
+        mlp_input = torch.clamp(mlp_input, -4, 4.0)
+        self.logt('normalized_AaD', mlp_input)
 
         outputs = attn_outputs[1:]
+        #mlp_layernorm_out = self.input_layernorm(attention_output)
 
         # MLP.
-        mlp_output = self.mlp(mlp_layernorm_out)
+        mlp_output = self.mlp(mlp_input)
+        self.logt('layer_out/mlp_output', mlp_output)
 
         if self.config.new_decoder_architecture or self.config.parallel_attn:
             mlp_output += attention_output
 
-        output = dropout_add(mlp_output, residual, self.config.hidden_dropout, training=self.training)
+        # output = dropout_add(mlp_output, residual, self.config.hidden_dropout, training=self.training)
+        output = residual + mlp_output
 
         if use_cache:
             outputs = (output,) + outputs
@@ -973,6 +1038,9 @@ class FalconPreTrainedModel(PreTrainedModel):
         return config
 
 
+MUP_EMB_INPUT_SCALE = 10.667
+MUP_LOGITS_SCALE = 0.125
+
 @add_start_docstrings(
     "The bare Falcon Model transformer outputting raw hidden-states without any specific head on top.",
     FALCON_START_DOCSTRING,
@@ -989,9 +1057,9 @@ class FalconModel(FalconPreTrainedModel):
         self.word_embeddings = nn.Embedding(config.vocab_size, self.embed_dim)
 
         # Transformer blocks
-        self.h = nn.ModuleList([FalconDecoderLayer(config) for _ in range(config.num_hidden_layers)])
+        self.h = nn.ModuleList([FalconDecoderLayer(config, li) for li in range(config.num_hidden_layers)])
         self._use_flash_attention_2 = config._attn_implementation == "flash_attention_2"
-        self._use_sdpa = config._attn_implementation == "sdpa"
+        self._use_sdpa = False #config._attn_implementation == "sdpa"
 
         # Final Layer Norm
         self.ln_f = LayerNorm(self.embed_dim, eps=config.layer_norm_epsilon)
@@ -1047,7 +1115,9 @@ class FalconModel(FalconPreTrainedModel):
 
         if inputs_embeds is None:
             inputs_embeds = self.word_embeddings(input_ids)
-
+        inputs_embeds = inputs_embeds * MUP_EMB_INPUT_SCALE
+        tensor_summary('emb_wt', self.word_embeddings.weight)
+        tensor_summary('emb_out', inputs_embeds)
         hidden_states = inputs_embeds
 
         if self.gradient_checkpointing and self.training:
@@ -1285,7 +1355,9 @@ class FalconForCausalLM(FalconPreTrainedModel):
         )
         hidden_states = transformer_outputs[0]
 
+        hidden_states = torch.clamp(hidden_states, -4., 4.)
         lm_logits = self.lm_head(hidden_states)
+        lm_logits = lm_logits * MUP_LOGITS_SCALE
 
         loss = None
         if labels is not None:
@@ -1294,7 +1366,7 @@ class FalconForCausalLM(FalconPreTrainedModel):
             shift_labels = labels[..., 1:].contiguous()
             batch_size, seq_length, vocab_size = shift_logits.shape
             # Flatten the tokens
-            loss_fct = CrossEntropyLoss()
+            loss_fct = CrossEntropyLoss(reduction='mean')
             loss = loss_fct(
                 shift_logits.view(batch_size * seq_length, vocab_size), shift_labels.view(batch_size * seq_length)
             )
@@ -1302,7 +1374,6 @@ class FalconForCausalLM(FalconPreTrainedModel):
         if not return_dict:
             output = (lm_logits,) + transformer_outputs[1:]
             return ((loss,) + output) if loss is not None else output
-
         return CausalLMOutputWithCrossAttentions(
             loss=loss,
             logits=lm_logits,
